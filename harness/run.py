@@ -6,7 +6,9 @@ isolated subprocess, streams events through it, scores, and writes a signed
 result. See ../README.md and ../RULES.md before you start."""
 import sys
 import json
+import shutil
 import argparse
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -34,10 +36,11 @@ def main():
 
     phases_dir = ROOT / "phases"
     key_path = phases_dir / f"{args.phase}.key"
+    enc_path = phases_dir / f"{args.phase}_schedule.json.enc"
     if not key_path.exists():
         sys.exit(f"'{args.phase}.key' not released yet — check the phase schedule in README.md.")
     key = key_path.read_bytes()
-    ciphertext = (phases_dir / f"{args.phase}_schedule.json.enc").read_bytes()
+    ciphertext = enc_path.read_bytes()
     schedule = crypto.decrypt_schedule(ciphertext, key)
 
     baseline_path = ROOT / "data" / "baselines.json"
@@ -48,15 +51,35 @@ def main():
     labels = schedule["labels"]
     gt_by_key = {(t["type"], t["batch_id_or_ref"]): t["gt"] for t in truths}
 
-    BUDGET = BUDGET_BY_PHASE[args.phase]
-    run = IsolatedRun(args.defense, str(baseline_path), gt_by_key, budget=BUDGET)
+    # Both files are already decrypted into memory above — from here on they
+    # only exist on disk as bait for a child process that shouldn't have any
+    # way to reach them. Python-level patching of open()/FileIO/etc. turned
+    # out to be an incomplete defense (module-level code can run before a
+    # patch lands, and a stashed class reference or object.__subclasses__()
+    # walk survives a later rebind-only "patch" regardless). The only thing
+    # that actually closes it: the files genuinely aren't at any discoverable
+    # path for the child's entire lifetime, so no technique — however
+    # sophisticated — has anything to open. Move them to a randomized temp
+    # dir named only in this process's memory, restore afterward either way.
+    park_dir = Path(tempfile.mkdtemp(prefix="datasiege-parked-"))
+    parked_key = park_dir / key_path.name
+    parked_enc = park_dir / enc_path.name
+    shutil.move(str(key_path), str(parked_key))
+    shutil.move(str(enc_path), str(parked_enc))
 
-    verdicts = []
     try:
-        for ev in events:
-            verdicts.append(run.dispatch(ev))
+        BUDGET = BUDGET_BY_PHASE[args.phase]
+        run = IsolatedRun(args.defense, str(baseline_path), gt_by_key, budget=BUDGET)
+        verdicts = []
+        try:
+            for ev in events:
+                verdicts.append(run.dispatch(ev))
+        finally:
+            run.shutdown()
     finally:
-        run.shutdown()
+        shutil.move(str(parked_key), str(key_path))
+        shutil.move(str(parked_enc), str(enc_path))
+        park_dir.rmdir()
 
     result = scoring.score_run(verdicts, labels, run.toolkit.cost_ledger, BUDGET)
     result["phase"] = args.phase
