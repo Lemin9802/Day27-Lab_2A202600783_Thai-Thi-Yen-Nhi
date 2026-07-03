@@ -1,7 +1,9 @@
 # Reflection (≤1 page)
 
-Fill this in before you submit.
-
 **Which fault types were hardest to catch, and why?**
 
+The hardest faults are the subtle private-phase cases that sit close to the published clean baselines instead of clearly exceeding them. Obvious faults are straightforward: a batch profile outside row-count/null-rate/mean/staleness bounds, a contract violation, a lineage runtime spike, feature skew above the published sigma limit, or embedding/corpus values above their limits should alert immediately. The more difficult cases are near-boundary freshness, feature skew, embedding drift, and lineage changes where one static threshold can miss the fault while a lower threshold can create false positives. Lineage is especially tricky because missing upstream or orphaned downstream behavior is structural, so the detector must use any expected fields in the event payload when present and otherwise fall back to conservative graph-shape and learned-history checks.
+
 **What would you change about your cost/coverage tradeoff, if you had another pass?**
+
+I used one metered toolkit call per event type because the private stream budget is designed to allow full single-pass coverage with only light headroom. That spends more than a sparse sampler, but it avoids blind spots across all five event types and keeps the detector legal and general rather than tuned to a known seed. The tradeoff is controlled by not making redundant calls and by combining three layers: published baseline violations for high precision, near-boundary pressure for subtle faults, and robust `ctx.state` history to catch phase-specific shifts without hardcoding event IDs. With another pass, I would tune the near-boundary multipliers against practice/public diagnostics to reduce any false positives while preserving private-phase recall on subtle AI-infra and freshness faults.
