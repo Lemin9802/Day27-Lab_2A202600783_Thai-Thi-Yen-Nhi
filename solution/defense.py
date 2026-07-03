@@ -1,16 +1,14 @@
 """
 Data Siege defense.
 
-Private scoring rewards recall more than it punishes a small number of false
-alarms, so this detector uses full legal coverage: one toolkit call for every
-event, published baseline violations, near-boundary pressure, and run-local
-history in ctx.state. It does not read files, import unsupported modules, or
-hardcode event ids/answers.
+Precision-tuned legal detector. The previous aggressive version reached high
+recall but too many false positives. This version keeps the high-confidence
+rules and tightens tail/history triggers to improve private score.
 """
 from api import Verdict
 
 
-MIN_HISTORY = 6
+MIN_HISTORY = 8
 MAX_HISTORY = 100
 
 
@@ -75,7 +73,7 @@ def _add_history(ctx, key, value, ok=True):
         del series[: len(series) - MAX_HISTORY]
 
 
-def _robust_outlier(ctx, key, value, *, high_only=False, low_only=False, min_n=MIN_HISTORY, z=2.55):
+def _robust_outlier(ctx, key, value, *, high_only=False, low_only=False, min_n=MIN_HISTORY, z=2.75):
     value = _num(value)
     if value is None:
         return False, 0.0
@@ -84,7 +82,7 @@ def _robust_outlier(ctx, key, value, *, high_only=False, low_only=False, min_n=M
         return False, 0.0
     m = _median(vals)
     mad = _median([abs(v - m) for v in vals])
-    floor = max(abs(m) * 0.02, 0.001)
+    floor = max(abs(m) * 0.025, 0.001)
     scale = max(1.4826 * mad, floor)
     if high_only:
         score = (value - m) / scale
@@ -102,7 +100,7 @@ def _tool_error(result):
 def _verdict(alert, pillar, reasons, confidence=0.5):
     if alert:
         return Verdict(alert=True, confidence=max(0.55, min(0.99, confidence)), reason="; ".join(reasons), pillar=pillar)
-    return Verdict(alert=False, confidence=0.25, reason="within legal baseline/history envelope", pillar=pillar)
+    return Verdict(alert=False, confidence=0.25, reason="within tightened legal envelope", pillar=pillar)
 
 
 def _sig(values):
@@ -116,7 +114,7 @@ def _sig(values):
     return "|".join(clean)
 
 
-def _signature_anomaly(ctx, key, sig, *, min_total=3, dominance=0.58):
+def _signature_anomaly(ctx, key, sig, *, min_total=5, dominance=0.72):
     table = ctx.state.setdefault("signatures", {}).setdefault(key, {})
     total = sum(table.values())
     if total < min_total or not table:
@@ -177,40 +175,40 @@ def check_data_batch(payload, ctx):
     mean_p = _range_pressure(mean_amount, mean_min, mean_max)
     null_p = _high_pressure(null_rate, null_max)
     stale_p = _high_pressure(staleness, stale_max)
-    pressure_hits = [row_p >= 0.74, mean_p >= 0.74, null_p >= 0.72, stale_p >= 0.72]
+    pressure_hits = [row_p >= 0.82, mean_p >= 0.82, null_p >= 0.82, stale_p >= 0.82]
 
     if not reasons:
-        if row_p >= 0.84:
-            reasons.append("row_count_high_tail_pressure")
+        if row_p >= 0.92:
+            reasons.append("row_count_extreme_tail_pressure")
             confidence = max(confidence, 0.74)
-        if mean_p >= 0.84:
-            reasons.append("mean_amount_high_tail_pressure")
+        if mean_p >= 0.92:
+            reasons.append("mean_amount_extreme_tail_pressure")
             confidence = max(confidence, 0.74)
-        if null_p >= 0.80:
-            reasons.append("customer_id_null_rate_high_tail_pressure")
+        if null_p >= 0.90:
+            reasons.append("customer_id_null_rate_extreme_tail_pressure")
             confidence = max(confidence, 0.74)
-        if stale_p >= 0.80:
-            reasons.append("batch_staleness_high_tail_pressure")
+        if stale_p >= 0.90:
+            reasons.append("batch_staleness_extreme_tail_pressure")
             confidence = max(confidence, 0.74)
         if len([x for x in pressure_hits if x]) >= 2:
-            reasons.append("multiple_batch_metrics_in_clean_tail")
+            reasons.append("multiple_batch_metrics_in_extreme_clean_tail")
             confidence = max(confidence, 0.80)
 
     dyn = [
-        ("checks.row_count", row, False),
-        ("checks.mean_amount", mean_amount, False),
-        ("checks.std_amount", std_amount, True),
-        ("checks.null_rate", null_rate, True),
-        ("checks.staleness", staleness, True),
+        ("checks.row_count", row, False, 2.95),
+        ("checks.mean_amount", mean_amount, False, 2.95),
+        ("checks.std_amount", std_amount, True, 2.75),
+        ("checks.null_rate", null_rate, True, 2.75),
+        ("checks.staleness", staleness, True, 2.75),
     ]
-    for key, value, high_only in dyn:
-        outlier, score = _robust_outlier(ctx, key, value, high_only=high_only, z=2.45 if high_only else 2.60)
+    for key, value, high_only, z in dyn:
+        outlier, score = _robust_outlier(ctx, key, value, high_only=high_only, z=z)
         if outlier:
             reasons.append(key.split(".")[-1] + "_robust_history_outlier")
             confidence = max(confidence, min(0.94, 0.62 + score / 18.0))
 
     alert = bool(reasons)
-    for key, value, _ in dyn:
+    for key, value, _, _ in dyn:
         _add_history(ctx, key, value, ok=not alert)
     return _verdict(alert, "checks", reasons, confidence)
 
@@ -232,12 +230,12 @@ def check_contract_checkpoint(payload, ctx):
     if delay is not None and max_delay is not None and delay > max_delay:
         reasons.append("contract_freshness_sla_exceeded")
         confidence = max(confidence, 0.97)
-    elif delay is not None and max_delay is not None and delay >= 0.78 * max_delay:
-        reasons.append("contract_freshness_high_tail_pressure")
+    elif delay is not None and max_delay is not None and delay >= 0.90 * max_delay:
+        reasons.append("contract_freshness_extreme_tail_pressure")
         confidence = max(confidence, 0.73)
 
     key = "contracts.freshness_delay." + str(payload.get("contract_id", "all"))
-    outlier, score = _robust_outlier(ctx, key, delay, high_only=True, z=2.45)
+    outlier, score = _robust_outlier(ctx, key, delay, high_only=True, z=2.80)
     if outlier:
         reasons.append("contract_freshness_robust_history_outlier")
         confidence = max(confidence, min(0.94, 0.62 + score / 18.0))
@@ -283,8 +281,8 @@ def check_lineage_run(payload, ctx):
     if duration is not None and max_duration is not None and duration > max_duration:
         reasons.append("lineage_runtime_above_published_clean_band")
         confidence = max(confidence, 0.97)
-    elif duration is not None and max_duration is not None and duration >= 0.78 * max_duration:
-        reasons.append("lineage_runtime_high_tail_pressure")
+    elif duration is not None and max_duration is not None and duration >= 0.90 * max_duration:
+        reasons.append("lineage_runtime_extreme_tail_pressure")
         confidence = max(confidence, 0.72)
 
     expected_upstream = _payload_expected_set(payload)
@@ -301,22 +299,22 @@ def check_lineage_run(payload, ctx):
 
     key = _lineage_key(payload)
     upstream_sig = _sig(upstream_set)
-    up_anom, _ = _signature_anomaly(ctx, key + ".upstream_sig", upstream_sig, min_total=3, dominance=0.55)
+    up_anom, _ = _signature_anomaly(ctx, key + ".upstream_sig", upstream_sig)
     if up_anom:
-        reasons.append("lineage_upstream_signature_changed_from_run_history")
-        confidence = max(confidence, 0.88)
-
-    down_sig = str(int(downstream_count)) if downstream_count is not None and downstream_count == int(downstream_count) else str(downstream_count)
-    down_anom, _ = _signature_anomaly(ctx, key + ".downstream_sig", down_sig, min_total=3, dominance=0.55)
-    if down_anom:
-        reasons.append("lineage_downstream_count_changed_from_run_history")
+        reasons.append("lineage_upstream_signature_changed_from_stable_history")
         confidence = max(confidence, 0.86)
 
-    outlier, score = _robust_outlier(ctx, key + ".duration_ms", duration, high_only=True, z=2.45)
+    down_sig = str(int(downstream_count)) if downstream_count is not None and downstream_count == int(downstream_count) else str(downstream_count)
+    down_anom, _ = _signature_anomaly(ctx, key + ".downstream_sig", down_sig)
+    if down_anom:
+        reasons.append("lineage_downstream_count_changed_from_stable_history")
+        confidence = max(confidence, 0.84)
+
+    outlier, score = _robust_outlier(ctx, key + ".duration_ms", duration, high_only=True, z=2.80)
     if outlier:
         reasons.append("lineage_runtime_robust_history_outlier")
         confidence = max(confidence, min(0.94, 0.62 + score / 18.0))
-    outlier, score = _robust_outlier(ctx, key + ".downstream_count", downstream_count, z=2.45)
+    outlier, score = _robust_outlier(ctx, key + ".downstream_count", downstream_count, z=2.80)
     if outlier:
         reasons.append("lineage_downstream_count_robust_history_outlier")
         confidence = max(confidence, min(0.93, 0.62 + score / 18.0))
@@ -342,12 +340,12 @@ def check_feature_materialization(payload, ctx):
     if shift is not None and max_shift is not None and shift > max_shift:
         reasons.append("feature_train_serving_skew_above_published_clean_band")
         confidence = max(confidence, 0.97)
-    elif shift is not None and max_shift is not None and shift >= 0.58 * max_shift:
-        reasons.append("feature_train_serving_skew_high_tail_pressure")
+    elif shift is not None and max_shift is not None and shift >= 0.72 * max_shift:
+        reasons.append("feature_train_serving_skew_tail_pressure")
         confidence = max(confidence, 0.74)
 
     key = "feature.shift." + str(payload.get("feature_view", "all"))
-    outlier, score = _robust_outlier(ctx, key, shift, high_only=True, z=2.35)
+    outlier, score = _robust_outlier(ctx, key, shift, high_only=True, z=2.70)
     if outlier:
         reasons.append("feature_shift_robust_history_outlier")
         confidence = max(confidence, min(0.94, 0.62 + score / 18.0))
@@ -379,19 +377,19 @@ def check_embedding_batch(payload, ctx):
         confidence = max(confidence, 0.97)
 
     if not reasons:
-        if centroid_p >= 0.62:
-            reasons.append("embedding_centroid_shift_high_tail_pressure")
+        if centroid_p >= 0.78:
+            reasons.append("embedding_centroid_shift_tail_pressure")
             confidence = max(confidence, 0.74)
-        if age_p >= 0.66:
-            reasons.append("rag_corpus_age_high_tail_pressure")
+        if age_p >= 0.82:
+            reasons.append("rag_corpus_age_tail_pressure")
             confidence = max(confidence, 0.73)
-        if centroid_p >= 0.50 and age_p >= 0.50:
+        if centroid_p >= 0.66 and age_p >= 0.66:
             reasons.append("combined_embedding_and_corpus_tail_pressure")
             confidence = max(confidence, 0.79)
 
     prefix = "embedding." + str(payload.get("corpus", "all"))
     for suffix, value in (("centroid", centroid), ("age", age)):
-        outlier, score = _robust_outlier(ctx, prefix + "." + suffix, value, high_only=True, z=2.35)
+        outlier, score = _robust_outlier(ctx, prefix + "." + suffix, value, high_only=True, z=2.70)
         if outlier:
             reasons.append("embedding_" + suffix + "_robust_history_outlier")
             confidence = max(confidence, min(0.94, 0.62 + score / 18.0))
